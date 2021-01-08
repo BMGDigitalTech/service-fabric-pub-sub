@@ -31,6 +31,7 @@ namespace SoCreate.ServiceFabric.PubSub
         private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1);
         private readonly IBrokerEventsManager _brokerEventsManager;
         private readonly SubscriptionFactory _subscriptionFactory;
+        private readonly IProxyFactories _proxyFactories;
 
         /// <summary>
         /// Gets the state key for all subscriber queues.
@@ -78,7 +79,7 @@ namespace SoCreate.ServiceFabric.PubSub
         /// <param name="serviceContext"></param>
         /// <param name="enableAutoDiscovery"></param>
         /// <param name="brokerEventsManager"></param>
-        protected BrokerService(StatefulServiceContext serviceContext, bool enableAutoDiscovery = true, IBrokerEventsManager brokerEventsManager = null)
+        protected BrokerService(StatefulServiceContext serviceContext, bool enableAutoDiscovery = true, IBrokerEventsManager brokerEventsManager = null, IProxyFactories proxyFactories = null)
             : base(serviceContext)
         {
             if (enableAutoDiscovery)
@@ -91,6 +92,7 @@ namespace SoCreate.ServiceFabric.PubSub
 
             _brokerEventsManager = brokerEventsManager ?? new DefaultBrokerEventsManager();
             _subscriptionFactory = new SubscriptionFactory(StateManager);
+            _proxyFactories = proxyFactories ?? new ProxyFactories();
         }
 
         /// <summary>
@@ -101,7 +103,7 @@ namespace SoCreate.ServiceFabric.PubSub
         /// <param name="enableAutoDiscovery"></param>
         /// <param name="brokerEvents"></param>
         protected BrokerService(StatefulServiceContext serviceContext,
-            IReliableStateManagerReplica2 reliableStateManagerReplica, bool enableAutoDiscovery = true, IBrokerEventsManager brokerEvents = null)
+            IReliableStateManagerReplica2 reliableStateManagerReplica, bool enableAutoDiscovery = true, IBrokerEventsManager brokerEvents = null, IProxyFactories proxyFactories = null)
             : base(serviceContext, reliableStateManagerReplica)
         {
             if (enableAutoDiscovery)
@@ -114,6 +116,7 @@ namespace SoCreate.ServiceFabric.PubSub
 
             _brokerEventsManager = brokerEvents ?? new DefaultBrokerEventsManager();
             _subscriptionFactory = new SubscriptionFactory(StateManager);
+            _proxyFactories = proxyFactories ?? new ProxyFactories();
         }
 
         protected virtual void SetupEvents(IBrokerEvents events)
@@ -133,16 +136,22 @@ namespace SoCreate.ServiceFabric.PubSub
 
             var brokerState = await TimeoutRetryHelper.Execute((token, state) => StateManager.GetOrAddAsync<IReliableDictionary<string, BrokerServiceState>>(messageTypeName));
 
+            var subscriptionDetails = new SubscriptionDetails(reference, messageTypeName, isOrdered);
+
+            ISubscription subscription = null;
             await TimeoutRetryHelper.ExecuteInTransaction(StateManager, async (tx, token, state) =>
             {
-                var subscriptionDetails = new SubscriptionDetails(reference, messageTypeName, isOrdered);
-                var subscription = await _subscriptionFactory.CreateAsync(tx, subscriptionDetails);
+                subscription = await _subscriptionFactory.CreateAsync(tx, subscriptionDetails);
                 await brokerState.AddOrUpdateSubscription(tx, Subscribers, subscriptionDetails);
 
-                _subscriptions.AddOrUpdate(subscriptionDetails.QueueName, subscription, (key, old) => subscription);
                 ServiceEventSourceMessage($"Registered subscriber: {reference.Name}");
                 await _brokerEventsManager.OnSubscribedAsync(subscriptionDetails.QueueName, reference, messageTypeName);
             }, cancellationToken: CancellationToken.None);
+
+            if (subscription != null)
+            {
+                _subscriptions.AddOrUpdate(subscriptionDetails.QueueName, subscription, (key, old) => subscription);
+            }
         }
 
         /// <summary>
@@ -313,7 +322,6 @@ namespace SoCreate.ServiceFabric.PubSub
                         var current = enumerator.Current as IReliableDictionary<string, BrokerServiceState>;
                         if (current == null) continue;
 
-
                         var result = await current.TryGetValueAsync(tx, Subscribers);
                         if (!result.HasValue) continue;
 
@@ -360,7 +368,7 @@ namespace SoCreate.ServiceFabric.PubSub
                     {
                         try
                         {
-                            await subscription.DeliverMessageAsync(message.Value);
+                            await subscription.DeliverMessageAsync(message.Value, _proxyFactories);
                             await _brokerEventsManager.OnMessageDeliveredAsync(details.QueueName, details.ServiceOrActorReference, message.Value);
                         }
                         catch (Exception ex)
